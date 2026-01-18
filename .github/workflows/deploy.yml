@@ -105,13 +105,49 @@ jobs:
       - name: Update Lambda function code
         env:
           LAMBDA_NAME: ${{ secrets.LAMBDA_FUNCTION_NAME }}
+          # Optional secrets used for S3 fallback when the package is too large to upload directly
+          DEPLOY_S3_BUCKET: ${{ secrets.DEPLOY_S3_BUCKET }}
+          DEPLOY_S3_KEY_PREFIX: ${{ secrets.DEPLOY_S3_KEY_PREFIX }}
         run: |
           if [ -z "${LAMBDA_NAME}" ]; then
             echo "ERROR: Set the secret LAMBDA_FUNCTION_NAME"
             exit 1
           fi
-          # If the file is still too large (>50MB), we should use S3, but let's try direct upload first after cleanup.
-          aws lambda update-function-code --function-name "${LAMBDA_NAME}" --zip-file fileb://function.zip
+
+          ZIP_FILE=function.zip
+          if [ ! -f "${ZIP_FILE}" ]; then
+            echo "ERROR: ${ZIP_FILE} not found"
+            exit 1
+          fi
+
+          # Get file size in bytes (portable between linux stat implementations)
+          filesize=$(stat -c%s "${ZIP_FILE}" 2>/dev/null || stat -f%z "${ZIP_FILE}" 2>/dev/null || echo 0)
+          echo "Package size: ${filesize} bytes"
+
+          # Threshold (bytes): use ~70MB to stay under the UpdateFunctionCode direct upload limit.
+          threshold=70000000
+
+          if [ "${filesize}" -lt "${threshold}" ]; then
+            echo "Uploading directly via aws lambda update-function-code (size below threshold)"
+            aws lambda update-function-code --function-name "${LAMBDA_NAME}" --zip-file fileb://"${ZIP_FILE}"
+          else
+            echo "Package is larger than ${threshold} bytes. Using S3 upload + UpdateFunctionCode from S3."
+            if [ -z "${DEPLOY_S3_BUCKET}" ]; then
+              echo "ERROR: DEPLOY_S3_BUCKET secret is not set. To enable large-package deployments set the secret DEPLOY_S3_BUCKET to an S3 bucket name."
+              echo "You can set DEPLOY_S3_KEY_PREFIX (optional) to control the uploaded key prefix."
+              exit 1
+            fi
+
+            key_prefix=${DEPLOY_S3_KEY_PREFIX:-"deploy"}
+            timestamp=$(date +%Y%m%d-%H%M%S)
+            s3_key="${key_prefix}/${LAMBDA_NAME}-${timestamp}.zip"
+
+            echo "Uploading ${ZIP_FILE} to s3://${DEPLOY_S3_BUCKET}/${s3_key}"
+            aws s3 cp "${ZIP_FILE}" "s3://${DEPLOY_S3_BUCKET}/${s3_key}"
+
+            echo "Updating Lambda from S3 object"
+            aws lambda update-function-code --function-name "${LAMBDA_NAME}" --s3-bucket "${DEPLOY_S3_BUCKET}" --s3-key "${s3_key}"
+          fi
 
       - name: Confirm deployment
         env:
