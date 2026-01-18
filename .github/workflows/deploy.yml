@@ -33,7 +33,26 @@ jobs:
           set -e
           rm -rf package || true
           mkdir package
+          # Exclude heavy libraries that are already available in Lambda or can be reduced
+          # pandas and pyarrow are very large. We should try to use a Lambda Layer or exclude them if possible.
+          # For now, let's try to install without dependencies for boto3 (it's in Lambda runtime)
+          # and use --no-deps for some if needed, but pip install -t installs everything.
+          
+          # Strategy: Install requirements but remove heavy stuff that might not be needed or use layers.
+          # However, pandas IS needed. The issue is the size limit (50MB zipped direct upload).
+          
           pip install --upgrade -r requirements.txt --target package
+          
+          # Cleanup to reduce size
+          cd package
+          find . -type d -name "tests" -exec rm -rf {} +
+          find . -type d -name "__pycache__" -exec rm -rf {} +
+          rm -rf *.dist-info *.egg-info
+          
+          # Boto3 and botocore are included in the AWS Lambda Python runtime.
+          # Removing them saves significant space (~50MB+ unzipped).
+          rm -rf boto3* botocore* s3transfer*
+          cd ..
 
       - name: Copy project files into package
         run: |
@@ -48,6 +67,22 @@ jobs:
           zip -r ../function.zip . -x "*.pyc" "__pycache__/*"
           cd ..
           ls -lh function.zip
+
+      - name: Debug Auth Configuration
+        run: |
+          echo "Checking authentication configuration..."
+          if [ -z "$AWS_ROLE_TO_ASSUME" ]; then
+            echo "AWS_ROLE_TO_ASSUME is empty. Workflow will attempt to use Access Keys."
+          else
+            echo "AWS_ROLE_TO_ASSUME is set. Workflow will attempt to use OIDC."
+          fi
+          
+          # Check if region is set (without printing secret if it was one, though region usually isn't)
+          if [ -z "${{ secrets.AWS_REGION }}" ]; then
+             echo "WARNING: AWS_REGION secret is empty!"
+          else
+             echo "AWS_REGION is set."
+          fi
 
       - name: Configure AWS credentials (assume role via OIDC)
         if: env.AWS_ROLE_TO_ASSUME != ''
@@ -75,6 +110,7 @@ jobs:
             echo "ERROR: Set the secret LAMBDA_FUNCTION_NAME"
             exit 1
           fi
+          # If the file is still too large (>50MB), we should use S3, but let's try direct upload first after cleanup.
           aws lambda update-function-code --function-name "${LAMBDA_NAME}" --zip-file fileb://function.zip
 
       - name: Confirm deployment
