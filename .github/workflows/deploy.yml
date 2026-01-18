@@ -48,14 +48,14 @@ jobs:
           ls -lh function.zip
 
       - name: Configure AWS credentials (assume role via OIDC)
-        if: ${{ secrets.AWS_ROLE_TO_ASSUME != '' }}
+        if: secrets.AWS_ROLE_TO_ASSUME != ''
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Configure AWS credentials (access key fallback)
-        if: ${{ secrets.AWS_ROLE_TO_ASSUME == '' }}
+        if: secrets.AWS_ROLE_TO_ASSUME == ''
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
