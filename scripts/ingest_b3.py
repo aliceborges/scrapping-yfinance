@@ -142,7 +142,7 @@ def df_to_parquet_bytes(df, ingest_date=None):
 
 
 def upload_parquet_bytes_to_s3(parquet_bytes, bucket_name, ingest_date, region_name=None):
-    """Upload parquet bytes directly to S3 under raw/data_ingestao=YYYY-MM-DD/arquivo.parquet"""
+    """Upload parquet bytes directly to S3 under raw/data_ingestao=YYYY-MM-DD/file.parquet"""
     session_kwargs = {}
     if region_name:
         session_kwargs['region_name'] = region_name
@@ -173,7 +173,7 @@ def upload_parquet_bytes_to_s3(parquet_bytes, bucket_name, ingest_date, region_n
         logger.exception("Bucket check failed: %s", e)
         raise
 
-    s3_key = f"raw/data_ingestao={ingest_date}/arquivo.parquet"
+    s3_key = f"raw/data_ingestao={ingest_date}/file.parquet"
 
     logger.info("Uploading parquet bytes to s3://%s/%s (bucket_check=%s) - size=%s bytes", bucket_name, s3_key, bucket_check, len(parquet_bytes))
 
@@ -244,38 +244,113 @@ def main():
 
     args = parser.parse_args()
 
-    tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
+    result = run_ingest(
+        tickers=args.tickers,
+        out_dir=args.out_dir,
+        ingest_date=args.date,
+        period=args.period,
+        interval=args.interval,
+        s3_bucket=args.s3_bucket,
+        aws_region=args.aws_region,
+    )
 
-    if not tickers:
-        logger.error("No tickers provided")
+    if isinstance(result, dict) and result.get("statusCode", 200) >= 400:
         raise SystemExit(1)
 
-    raw = fetch_tickers(tickers, period=args.period, interval=args.interval)
-    if raw.empty:
-        logger.error("No data downloaded for provided tickers")
-        raise SystemExit(1)
 
-    processed = process_df(raw, ingest_date=args.date)
+def run_ingest(tickers, out_dir=".", ingest_date=None, period="1mo", interval="1d", s3_bucket=None, aws_region=None):
+    """Reusable ingestion function.
 
-    # produce parquet bytes in-memory (no local file creation)
-    ingest_date_val = args.date or datetime.now(timezone.utc).date().isoformat()
-    parquet_bytes = df_to_parquet_bytes(processed, ingest_date=ingest_date_val)
+    Parameters accepted as either a comma-separated string or a list of tickers.
+    Returns a dict with statusCode and body for easier use from Lambda.
+    """
+    try:
+        # Normalize tickers param
+        if isinstance(tickers, str):
+            tickers_list = [t.strip() for t in tickers.split(",") if t.strip()]
+        elif isinstance(tickers, (list, tuple)):
+            tickers_list = [str(t).strip() for t in tickers if t and str(t).strip()]
+        else:
+            tickers_list = []
 
-    # Determine bucket from CLI arg or environment variable; credentials must come from env/chain
-    bucket = args.s3_bucket or os.getenv('S3_BUCKET_NAME')
-    aws_region = args.aws_region or os.getenv('AWS_REGION')
+        if not tickers_list:
+            msg = "No tickers provided"
+            logger.error(msg)
+            return {"statusCode": 400, "body": msg}
 
-    if bucket:
-        try:
-            s3_uri = upload_parquet_bytes_to_s3(parquet_bytes, bucket, ingest_date_val, region_name=aws_region)
-            logger.info("Upload successful: %s", s3_uri)
-        except Exception as e:
-            logger.exception("S3 upload failed")
-            raise SystemExit(1)
-    else:
-        logger.info("No S3 bucket configured (no --s3-bucket and no S3_BUCKET_NAME env). Skipping upload and not creating local file.")
+        raw = fetch_tickers(tickers_list, period=period, interval=interval)
+        if raw.empty:
+            msg = "No data downloaded for provided tickers"
+            logger.error(msg)
+            return {"statusCode": 204, "body": msg}
 
-    logger.info("Ingest finished.")
+        processed = process_df(raw, ingest_date=ingest_date)
+
+        ingest_date_val = ingest_date or datetime.now(timezone.utc).date().isoformat()
+        parquet_bytes = df_to_parquet_bytes(processed, ingest_date=ingest_date_val)
+
+        bucket = s3_bucket or os.getenv("S3_BUCKET_NAME")
+        aws_region = aws_region or os.getenv("AWS_REGION")
+
+        if bucket:
+            try:
+                s3_uri = upload_parquet_bytes_to_s3(parquet_bytes, bucket, ingest_date_val, region_name=aws_region)
+                logger.info("Upload successful: %s", s3_uri)
+                return {"statusCode": 200, "body": {"message": "Upload successful", "s3_uri": s3_uri}}
+            except Exception as e:
+                logger.exception("S3 upload failed")
+                return {"statusCode": 500, "body": str(e)}
+        else:
+            logger.info("No S3 bucket configured (no s3_bucket arg and no S3_BUCKET_NAME env). Skipping upload and not creating local file.")
+            return {"statusCode": 200, "body": "Ingest finished (no upload)"}
+
+    except Exception as exc:
+        logger.exception("Unexpected error in run_ingest")
+        return {"statusCode": 500, "body": str(exc)}
+
+
+def lambda_handler(event, context):
+    """AWS Lambda handler.
+
+    Expected event keys (all optional but at least `tickers` is recommended):
+      - tickers: comma-separated string or list of ticker symbols
+      - date: YYYY-MM-DD
+      - period: yfinance period (e.g. '1mo')
+      - interval: yfinance interval (e.g. '1d')
+      - s3_bucket: bucket name (overrides S3_BUCKET_NAME env var)
+      - aws_region: AWS region
+
+    Returns a dict compatible with Lambda proxy integration.
+    """
+    logger.info("Lambda invoked with event: %s", event)
+
+    # map event to params
+    tickers = event.get("tickers") or event.get("ticker")
+    ingest_date = event.get("date") or event.get("ingest_date")
+    period = event.get("period")
+    interval = event.get("interval")
+    s3_bucket = event.get("s3_bucket") or event.get("bucket")
+    aws_region = event.get("aws_region") or event.get("region")
+
+    result = run_ingest(
+        tickers=tickers,
+        out_dir=event.get("out_dir", "."),
+        ingest_date=ingest_date,
+        period=period or "1mo",
+        interval=interval or "1d",
+        s3_bucket=s3_bucket,
+        aws_region=aws_region,
+    )
+
+    # Ensure Lambda-friendly return structure
+    status = result.get("statusCode", 200) if isinstance(result, dict) else 200
+    body = result.get("body", "") if isinstance(result, dict) else result
+
+    # If body is a dict, keep it as-is; otherwise stringify
+    if not isinstance(body, (dict, list)):
+        body = {"message": body}
+
+    return {"statusCode": status, "body": body}
 
 
 if __name__ == "__main__":

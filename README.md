@@ -24,7 +24,7 @@ python .\scripts\ingest_b3.py --tickers PETR4.SA,VALE3.SA,^BVSP --out-dir .
 O arquivo Parquet será salvo em:
 
 ```
-./raw/data_ingestao=YYYY-MM-DD/dados.parquet
+./raw/data_ingestao=YYYY-MM-DD/file.parquet
 ```
 
 ## Observações
